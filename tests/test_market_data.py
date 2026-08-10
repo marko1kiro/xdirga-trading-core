@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
@@ -212,11 +213,35 @@ def test_timeframe_durations_are_exact() -> None:
     }
 
 
+def test_validation_public_signature_and_immutable_count_fields() -> None:
+    signature = inspect.signature(validate_candles)
+    assert list(signature.parameters) == [
+        "candles",
+        "now",
+        "max_age",
+        "expected_count",
+    ]
+    assert signature.parameters["expected_count"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["expected_count"].default is None
+    result = validate_candles(
+        [candle()], now=BASE, max_age=timedelta(), expected_count=1
+    )
+    assert (
+        result.all_closed,
+        result.expected_count,
+        result.actual_count,
+        result.count_complete,
+    ) == (True, 1, 1, True)
+    with pytest.raises(FrozenInstanceError):
+        result.actual_count = 2  # type: ignore[misc]
+
+
 def test_trusted_sequence() -> None:
     result = validate_candles(
         [candle(0), candle(1), candle(2)],
         now=BASE + timedelta(minutes=3),
         max_age=timedelta(minutes=1),
+        expected_count=3,
     )
 
     assert result.trusted
@@ -225,7 +250,76 @@ def test_trusted_sequence() -> None:
     assert result.missing_timestamps == ()
     assert not result.latest_stale
     assert result.latest_closed
+    assert result.all_closed
+    assert result.count_complete
     assert result.reason_codes == ()
+
+
+@pytest.mark.parametrize(
+    ("expected_count", "message"),
+    [
+        (True, "expected_count must be a positive integer or None"),
+        (0, "expected_count must be a positive integer or None"),
+        (-1, "expected_count must be a positive integer or None"),
+        (1.5, "expected_count must be a positive integer or None"),
+    ],
+)
+def test_validation_rejects_invalid_expected_count(
+    expected_count: object, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_candles(
+            [candle()], now=BASE, max_age=timedelta(), expected_count=expected_count  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("actual_count", [2, 4])
+def test_count_mismatch_is_untrusted(actual_count: int) -> None:
+    result = validate_candles(
+        [candle(minute) for minute in range(actual_count)],
+        now=BASE + timedelta(minutes=actual_count - 1),
+        max_age=timedelta(),
+        expected_count=3,
+    )
+    assert (result.expected_count, result.actual_count, result.count_complete) == (
+        3,
+        actual_count,
+        False,
+    )
+    assert result.reason_codes == (ReasonCode.COUNT_MISMATCH,)
+
+
+def test_empty_sequence_reports_count_mismatch_after_empty() -> None:
+    result = validate_candles([], now=BASE, max_age=timedelta(), expected_count=1)
+    assert result.reason_codes == (ReasonCode.EMPTY, ReasonCode.COUNT_MISMATCH)
+
+
+def test_any_unclosed_candle_is_untrusted_before_latest_status() -> None:
+    result = validate_candles(
+        [candle(closed=False), candle(1)],
+        now=BASE + timedelta(minutes=1),
+        max_age=timedelta(),
+    )
+    assert result.all_closed is False
+    assert result.latest_closed is True
+    assert result.reason_codes == (ReasonCode.UNCLOSED_CANDLES,)
+
+
+def test_unclosed_reason_order_is_deterministic() -> None:
+    result = validate_candles(
+        [candle(closed=False), candle(0, closed=False)],
+        now=BASE + timedelta(minutes=2),
+        max_age=timedelta(),
+        expected_count=3,
+    )
+    assert result.reason_codes == (
+        ReasonCode.INVALID_ORDER,
+        ReasonCode.DUPLICATE_TIMESTAMPS,
+        ReasonCode.STALE_LATEST,
+        ReasonCode.LATEST_UNCLOSED,
+        ReasonCode.UNCLOSED_CANDLES,
+        ReasonCode.COUNT_MISMATCH,
+    )
 
 
 def test_empty_sequence_is_untrusted() -> None:
@@ -324,7 +418,10 @@ def test_unclosed_latest_candle_is_untrusted() -> None:
     )
 
     assert not result.latest_closed
-    assert result.reason_codes == (ReasonCode.LATEST_UNCLOSED,)
+    assert result.reason_codes == (
+        ReasonCode.LATEST_UNCLOSED,
+        ReasonCode.UNCLOSED_CANDLES,
+    )
 
 
 @pytest.mark.parametrize(

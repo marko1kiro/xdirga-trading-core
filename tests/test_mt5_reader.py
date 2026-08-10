@@ -320,15 +320,32 @@ def test_lifecycle_owner_restart_and_keyboard_interrupt() -> None:
 @pytest.mark.parametrize(
     "rows,reasons",
     [
-        ([], (ReasonCode.EMPTY,)),
-        ([rate(1_767_225_600), rate(1_767_225_660)], (ReasonCode.LATEST_UNCLOSED,)),
+        ([], (ReasonCode.EMPTY, ReasonCode.COUNT_MISMATCH)),
+        (
+            [rate(1_767_225_600), rate(1_767_225_660)],
+            (
+                ReasonCode.LATEST_UNCLOSED,
+                ReasonCode.UNCLOSED_CANDLES,
+                ReasonCode.COUNT_MISMATCH,
+            ),
+        ),
         (
             [rate(1_767_225_480), rate(1_767_225_600)],
-            (ReasonCode.MISSING_TIMESTAMPS, ReasonCode.LATEST_UNCLOSED),
+            (
+                ReasonCode.MISSING_TIMESTAMPS,
+                ReasonCode.LATEST_UNCLOSED,
+                ReasonCode.UNCLOSED_CANDLES,
+                ReasonCode.COUNT_MISMATCH,
+            ),
         ),
         (
             [rate(1_767_225_660), rate(1_767_225_600)],
-            (ReasonCode.INVALID_ORDER, ReasonCode.LATEST_UNCLOSED),
+            (
+                ReasonCode.INVALID_ORDER,
+                ReasonCode.LATEST_UNCLOSED,
+                ReasonCode.UNCLOSED_CANDLES,
+                ReasonCode.COUNT_MISMATCH,
+            ),
         ),
         (
             [rate(1_767_225_600), rate(1_767_225_600)],
@@ -336,6 +353,8 @@ def test_lifecycle_owner_restart_and_keyboard_interrupt() -> None:
                 ReasonCode.INVALID_ORDER,
                 ReasonCode.DUPLICATE_TIMESTAMPS,
                 ReasonCode.LATEST_UNCLOSED,
+                ReasonCode.UNCLOSED_CANDLES,
+                ReasonCode.COUNT_MISMATCH,
             ),
         ),
     ],
@@ -348,7 +367,29 @@ def test_read_maps_rates_preserves_order_and_composes_validation(
     fake.rates = rows
     result = value.read(Timeframe.M1, now=NOW, max_age=timedelta(minutes=1))
     assert result.validation.reason_codes == reasons
-    assert fake.calls[-1][1] == ("EURUSD", 11, 0, 256)
+    assert fake.calls[-1][1] == ("EURUSD", 11, 1, 256)
+
+
+@pytest.mark.parametrize("row_count", [256, 255, 257, 0])
+def test_read_requests_exact_history_once_preserves_all_rows(row_count: int) -> None:
+    value, fake = reader(history_count=256)
+    value.start()
+    fake.rates = [rate(1_767_225_600 + 60 * index) for index in range(row_count)]
+
+    result = value.read(Timeframe.M1, now=NOW, max_age=timedelta())
+
+    calls = [call for call in fake.calls if call[0] == "copy_rates_from_pos"]
+    assert calls == [("copy_rates_from_pos", ("EURUSD", 11, 1, 256), get_ident())]
+    assert len(result.candles) == row_count
+    assert tuple(candle.timestamp for candle in result.candles) == tuple(
+        datetime.fromtimestamp(1_767_225_600 + 60 * index, UTC)
+        for index in range(row_count)
+    )
+    assert result.validation.actual_count == row_count
+    assert result.validation.count_complete is (row_count == 256)
+    assert (ReasonCode.COUNT_MISMATCH in result.validation.reason_codes) is (
+        row_count != 256
+    )
 
 
 def test_read_errors_arguments_constants_normalizer_and_last_error() -> None:
@@ -441,7 +482,7 @@ def test_read_uses_exact_fixed_timeframe_mapping(
 
     value.read(timeframe, now=NOW, max_age=timedelta())
 
-    assert fake.calls[-1][1] == ("EURUSD", constant, 0, 2)
+    assert fake.calls[-1][1] == ("EURUSD", constant, 1, 2)
 
 
 @pytest.mark.parametrize("malformed", [None, True, 1.5])
