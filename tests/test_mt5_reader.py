@@ -320,15 +320,32 @@ def test_lifecycle_owner_restart_and_keyboard_interrupt() -> None:
 @pytest.mark.parametrize(
     "rows,reasons",
     [
-        ([], (ReasonCode.EMPTY,)),
-        ([rate(1_767_225_600), rate(1_767_225_660)], (ReasonCode.LATEST_UNCLOSED,)),
+        ([], (ReasonCode.EMPTY, ReasonCode.COUNT_MISMATCH)),
+        (
+            [rate(1_767_225_600), rate(1_767_225_660)],
+            (
+                ReasonCode.LATEST_UNCLOSED,
+                ReasonCode.UNCLOSED_CANDLES,
+                ReasonCode.COUNT_MISMATCH,
+            ),
+        ),
         (
             [rate(1_767_225_480), rate(1_767_225_600)],
-            (ReasonCode.MISSING_TIMESTAMPS, ReasonCode.LATEST_UNCLOSED),
+            (
+                ReasonCode.MISSING_TIMESTAMPS,
+                ReasonCode.LATEST_UNCLOSED,
+                ReasonCode.UNCLOSED_CANDLES,
+                ReasonCode.COUNT_MISMATCH,
+            ),
         ),
         (
             [rate(1_767_225_660), rate(1_767_225_600)],
-            (ReasonCode.INVALID_ORDER, ReasonCode.LATEST_UNCLOSED),
+            (
+                ReasonCode.INVALID_ORDER,
+                ReasonCode.LATEST_UNCLOSED,
+                ReasonCode.UNCLOSED_CANDLES,
+                ReasonCode.COUNT_MISMATCH,
+            ),
         ),
         (
             [rate(1_767_225_600), rate(1_767_225_600)],
@@ -336,6 +353,8 @@ def test_lifecycle_owner_restart_and_keyboard_interrupt() -> None:
                 ReasonCode.INVALID_ORDER,
                 ReasonCode.DUPLICATE_TIMESTAMPS,
                 ReasonCode.LATEST_UNCLOSED,
+                ReasonCode.UNCLOSED_CANDLES,
+                ReasonCode.COUNT_MISMATCH,
             ),
         ),
     ],
@@ -348,7 +367,7 @@ def test_read_maps_rates_preserves_order_and_composes_validation(
     fake.rates = rows
     result = value.read(Timeframe.M1, now=NOW, max_age=timedelta(minutes=1))
     assert result.validation.reason_codes == reasons
-    assert fake.calls[-1][1] == ("EURUSD", 11, 0, 256)
+    assert fake.calls[-1][1] == ("EURUSD", 11, 1, 256)
 
 
 def test_read_errors_arguments_constants_normalizer_and_last_error() -> None:
@@ -441,7 +460,7 @@ def test_read_uses_exact_fixed_timeframe_mapping(
 
     value.read(timeframe, now=NOW, max_age=timedelta())
 
-    assert fake.calls[-1][1] == ("EURUSD", constant, 0, 2)
+    assert fake.calls[-1][1] == ("EURUSD", constant, 1, 2)
 
 
 @pytest.mark.parametrize("malformed", [None, True, 1.5])
@@ -1248,6 +1267,108 @@ def test_normalization_has_only_approved_detached_cause() -> None:
     assert caught.__cause__.__class__.__name__ == "Mt5RateNormalizationError"
     assert caught.__cause__.__cause__ is None
     assert caught.__cause__.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("timeframe", "constant"),
+    [
+        (Timeframe.M1, 11),
+        (Timeframe.M5, 12),
+        (Timeframe.M15, 13),
+        (Timeframe.H1, 14),
+    ],
+)
+def test_read_requests_256_closed_exact_contiguous_history_from_position_one(
+    timeframe: Timeframe, constant: int
+) -> None:
+    value, fake = reader(history_count=256)
+    value.start()
+    seconds = int(timeframe.duration.total_seconds())
+    start = 1_767_225_600 - 256 * seconds
+    fake.rates = [rate(start + index * seconds) for index in range(256)]
+
+    result = value.read(timeframe, now=NOW, max_age=timeframe.duration)
+
+    assert [item.timestamp for item in result.candles] == [
+        datetime.fromtimestamp(start + index * seconds, UTC) for index in range(256)
+    ]
+    assert result.validation.reason_codes == ()
+    assert result.validation.trusted
+    assert (
+        result.validation.expected_count,
+        result.validation.actual_count,
+    ) == (256, 256)
+    assert result.validation.count_complete and result.validation.all_closed
+    fetches = [call[1] for call in fake.calls if call[0] == "copy_rates_from_pos"]
+    assert fetches == [("EURUSD", constant, 1, 256)]
+
+
+@pytest.mark.parametrize("count", [255, 257])
+def test_read_retains_exact_nondefault_history_count_evidence(count: int) -> None:
+    value, fake = reader(history_count=count)
+    value.start()
+    start = 1_767_225_600 - count * 60
+    fake.rates = [rate(start + index * 60) for index in range(count)]
+
+    result = value.read(Timeframe.M1, now=NOW, max_age=timedelta(minutes=1))
+
+    assert result.validation.reason_codes == ()
+    assert result.validation.trusted
+    assert (
+        result.validation.expected_count,
+        result.validation.actual_count,
+    ) == (count, count)
+    assert result.validation.count_complete and result.validation.all_closed
+    assert [call[1] for call in fake.calls if call[0] == "copy_rates_from_pos"] == [
+        ("EURUSD", 11, 1, count)
+    ]
+
+
+def test_read_empty_history_preserves_exact_count_evidence() -> None:
+    value, fake = reader(history_count=2)
+    value.start()
+    fake.rates = []
+
+    result = value.read(Timeframe.M1, now=NOW, max_age=timedelta())
+
+    assert (
+        result.validation.expected_count,
+        result.validation.actual_count,
+        result.validation.count_complete,
+    ) == (2, 0, False)
+    assert result.validation.reason_codes == (
+        ReasonCode.EMPTY,
+        ReasonCode.COUNT_MISMATCH,
+    )
+    assert not result.validation.trusted
+    assert [
+        call[1] for call in fake.calls if call[0] == "copy_rates_from_pos"
+    ] == [("EURUSD", 11, 1, 2)]
+
+
+def test_read_preserves_unexpected_active_row_and_exact_validation_evidence() -> None:
+    value, fake = reader(history_count=2)
+    value.start()
+    fake.rates = [rate(1_767_225_480), rate(1_767_225_540), rate(1_767_225_600)]
+
+    result = value.read(Timeframe.M1, now=NOW, max_age=timedelta(minutes=1))
+
+    assert len(result.candles) == 3
+    assert not result.candles[-1].closed
+    assert (
+        result.validation.expected_count,
+        result.validation.actual_count,
+        result.validation.count_complete,
+    ) == (2, 3, False)
+    assert result.validation.reason_codes == (
+        ReasonCode.LATEST_UNCLOSED,
+        ReasonCode.UNCLOSED_CANDLES,
+        ReasonCode.COUNT_MISMATCH,
+    )
+    assert not result.validation.trusted
+    assert [
+        call[1] for call in fake.calls if call[0] == "copy_rates_from_pos"
+    ] == [("EURUSD", 11, 1, 2)]
 
 
 def test_read_never_accesses_fake_mutation_or_generic_gateway_surface() -> None:

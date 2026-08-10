@@ -324,7 +324,10 @@ def test_unclosed_latest_candle_is_untrusted() -> None:
     )
 
     assert not result.latest_closed
-    assert result.reason_codes == (ReasonCode.LATEST_UNCLOSED,)
+    assert result.reason_codes == (
+        ReasonCode.LATEST_UNCLOSED,
+        ReasonCode.UNCLOSED_CANDLES,
+    )
 
 
 @pytest.mark.parametrize(
@@ -350,4 +353,153 @@ def test_validation_is_deterministic() -> None:
 
     assert validate_candles(candles, **arguments) == validate_candles(
         candles, **arguments
+    )
+
+
+def test_validation_exact_count_surface_and_immutable_evidence() -> None:
+    import inspect
+
+    signature = inspect.signature(validate_candles)
+    assert list(signature.parameters) == ["candles", "now", "max_age", "expected_count"]
+    assert signature.parameters["expected_count"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["expected_count"].default is None
+    result = validate_candles(
+        [candle()], now=BASE, max_age=timedelta(), expected_count=1
+    )
+    assert (
+        result.all_closed,
+        result.expected_count,
+        result.actual_count,
+        result.count_complete,
+    ) == (True, 1, 1, True)
+    with pytest.raises(FrozenInstanceError):
+        result.expected_count = 2  # type: ignore[misc]
+
+
+class BombSequence:
+    def __init__(self) -> None:
+        self.inspected = False
+
+    def __len__(self) -> int:
+        self.inspected = True
+        raise AssertionError("sequence inspected")
+
+    def __bool__(self) -> bool:
+        self.inspected = True
+        raise AssertionError("sequence inspected")
+
+    def __iter__(self):
+        self.inspected = True
+        raise AssertionError("sequence inspected")
+
+    def __getitem__(self, index: object) -> Candle:
+        self.inspected = True
+        raise AssertionError("sequence inspected")
+
+
+class HostileExpectedCount:
+    def __index__(self) -> int:
+        raise AssertionError("expected count inspected")
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("expected count inspected")
+
+
+@pytest.mark.parametrize(
+    "expected_count", [True, False, 0, -1, 1.5, "1", object(), HostileExpectedCount()]
+)
+def test_validation_rejects_invalid_expected_count_before_any_sequence_inspection(
+    expected_count: object,
+) -> None:
+    candles = BombSequence()
+    with pytest.raises(
+        ValueError, match="^expected_count must be a positive integer or None$"
+    ):
+        validate_candles(
+            candles,  # type: ignore[arg-type]
+            now=BASE,
+            max_age=timedelta(),
+            expected_count=expected_count,  # type: ignore[arg-type]
+        )
+    assert not candles.inspected
+
+
+@pytest.mark.parametrize(
+    ("candles", "expected_count", "expected", "reasons", "trusted"),
+    [
+        ([candle(0), candle(1)], 2, (True, 2, 2, True), (), True),
+        (
+            [candle(0)],
+            2,
+            (True, 2, 1, False),
+            (ReasonCode.STALE_LATEST, ReasonCode.COUNT_MISMATCH),
+            False,
+        ),
+        (
+            [candle(0), candle(1), candle(2)],
+            2,
+            (True, 2, 3, False),
+            (ReasonCode.COUNT_MISMATCH,),
+            False,
+        ),
+        (
+            [],
+            2,
+            (False, 2, 0, False),
+            (ReasonCode.EMPTY, ReasonCode.COUNT_MISMATCH),
+            False,
+        ),
+        ([candle(0), candle(1)], None, (True, None, 2, True), (), True),
+    ],
+)
+def test_validation_exact_count_evidence(
+    candles: list[Candle],
+    expected_count: int | None,
+    expected: tuple[bool, int | None, int, bool],
+    reasons: tuple[ReasonCode, ...],
+    trusted: bool,
+) -> None:
+    result = validate_candles(
+        candles,
+        now=BASE + timedelta(minutes=1),
+        max_age=timedelta(),
+        expected_count=expected_count,
+    )
+    assert (
+        result.all_closed,
+        result.expected_count,
+        result.actual_count,
+        result.count_complete,
+    ) == expected
+    assert result.reason_codes == reasons
+    assert result.trusted is trusted
+
+
+def test_validation_reports_any_unclosed_candle_in_exact_reason_order() -> None:
+    result = validate_candles(
+        [candle(0, closed=False), candle(1, closed=True)],
+        now=BASE + timedelta(minutes=1),
+        max_age=timedelta(),
+        expected_count=3,
+    )
+    assert not result.all_closed
+    assert result.latest_closed
+    assert result.reason_codes == (
+        ReasonCode.UNCLOSED_CANDLES,
+        ReasonCode.COUNT_MISMATCH,
+    )
+    assert not result.trusted
+
+
+def test_validation_reports_latest_unclosed_after_all_unclosed_evidence() -> None:
+    result = validate_candles(
+        [candle(0, closed=False), candle(1, closed=False)],
+        now=BASE + timedelta(minutes=1),
+        max_age=timedelta(),
+        expected_count=3,
+    )
+    assert result.reason_codes == (
+        ReasonCode.LATEST_UNCLOSED,
+        ReasonCode.UNCLOSED_CANDLES,
+        ReasonCode.COUNT_MISMATCH,
     )
