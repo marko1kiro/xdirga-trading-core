@@ -225,14 +225,80 @@ def test_trusted_sequence() -> None:
     assert result.missing_timestamps == ()
     assert not result.latest_stale
     assert result.latest_closed
+    assert result.all_closed
+    assert result.expected_count is None
+    assert result.actual_count == 3
+    assert result.count_complete
     assert result.reason_codes == ()
 
 
 def test_empty_sequence_is_untrusted() -> None:
-    result = validate_candles([], now=BASE, max_age=timedelta())
+    result = validate_candles([], now=BASE, max_age=timedelta(), expected_count=2)
 
     assert not result.trusted
-    assert result.reason_codes == (ReasonCode.EMPTY,)
+    assert result.expected_count == 2
+    assert result.actual_count == 0
+    assert not result.count_complete
+    assert not result.all_closed
+    assert result.reason_codes == (ReasonCode.EMPTY, ReasonCode.COUNT_MISMATCH)
+
+
+@pytest.mark.parametrize("expected_count", [True, False, 0, -1, 1.5, "2"])
+def test_validation_rejects_invalid_expected_count_before_sequence_inspection(
+    expected_count: object,
+) -> None:
+    with pytest.raises(
+        ValueError, match="expected_count must be a positive integer or None"
+    ):
+        validate_candles(
+            [candle(1), candle(0, symbol="GBPUSD")],
+            now=BASE,
+            max_age=timedelta(),
+            expected_count=expected_count,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("candles", "expected_count", "actual_count", "complete", "reasons"),
+    [
+        ([candle(0), candle(1)], 2, 2, True, ()),
+        ([candle(0)], 2, 1, False, (ReasonCode.COUNT_MISMATCH,)),
+        ([candle(0), candle(1), candle(2)], 2, 3, False, (ReasonCode.COUNT_MISMATCH,)),
+        ([], 2, 0, False, (ReasonCode.EMPTY, ReasonCode.COUNT_MISMATCH)),
+        ([candle(0)], None, 1, True, ()),
+    ],
+)
+def test_expected_count_evidence_is_exact(
+    candles: list[Candle],
+    expected_count: int | None,
+    actual_count: int,
+    complete: bool,
+    reasons: tuple[ReasonCode, ...],
+) -> None:
+    result = validate_candles(
+        candles,
+        now=BASE + timedelta(minutes=max(actual_count - 1, 0)),
+        max_age=timedelta(),
+        expected_count=expected_count,
+    )
+
+    assert result.expected_count == expected_count
+    assert result.actual_count == actual_count
+    assert result.count_complete is complete
+    assert result.reason_codes == reasons
+
+
+def test_short_fresh_closed_sequence_has_only_count_mismatch() -> None:
+    result = validate_candles(
+        [candle(0), candle(1)],
+        now=BASE + timedelta(minutes=2),
+        max_age=timedelta(minutes=1),
+        expected_count=3,
+    )
+
+    assert not result.trusted
+    assert result.all_closed
+    assert result.reason_codes == (ReasonCode.COUNT_MISMATCH,)
 
 
 def test_mixed_symbols_are_untrusted() -> None:
@@ -318,13 +384,34 @@ def test_latest_candle_at_max_age_is_fresh() -> None:
     assert not result.latest_stale
 
 
-def test_unclosed_latest_candle_is_untrusted() -> None:
+def test_unclosed_latest_candle_preserves_compatibility_reason_order() -> None:
     result = validate_candles(
-        [candle(closed=False)], now=BASE, max_age=timedelta()
+        [candle(closed=False)],
+        now=BASE,
+        max_age=timedelta(),
+        expected_count=2,
     )
 
     assert not result.latest_closed
-    assert result.reason_codes == (ReasonCode.LATEST_UNCLOSED,)
+    assert not result.all_closed
+    assert result.reason_codes == (
+        ReasonCode.LATEST_UNCLOSED,
+        ReasonCode.UNCLOSED_CANDLES,
+        ReasonCode.COUNT_MISMATCH,
+    )
+
+
+def test_nonlatest_unclosed_has_only_all_candles_reason() -> None:
+    result = validate_candles(
+        [candle(0, closed=False), candle(1)],
+        now=BASE + timedelta(minutes=1),
+        max_age=timedelta(),
+        expected_count=2,
+    )
+
+    assert result.latest_closed
+    assert not result.all_closed
+    assert result.reason_codes == (ReasonCode.UNCLOSED_CANDLES,)
 
 
 @pytest.mark.parametrize(

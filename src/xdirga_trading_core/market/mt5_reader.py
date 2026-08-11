@@ -262,7 +262,12 @@ class Mt5MarketReader:
             now,
             self._config.history_count,
             candles,
-            validate_candles(candles, now=now, max_age=max_age),
+            validate_candles(
+                candles,
+                now=now,
+                max_age=max_age,
+                expected_count=self._config.history_count,
+            ),
         )
 
     def stop(self) -> None:
@@ -332,7 +337,7 @@ def _read_rates(module: Any, timeframe: Timeframe, config: Mt5ReaderConfig) -> o
     if isinstance(raw_timeframe, bool):
         raise TypeError
     mapped = index(raw_timeframe)
-    return module.copy_rates_from_pos(config.symbol, mapped, 0, config.history_count)
+    return module.copy_rates_from_pos(config.symbol, mapped, 1, config.history_count)
 
 
 def _normalize(
